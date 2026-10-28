@@ -9,6 +9,8 @@
 #include <WiFiClient.h>
 #include <ArduinoMqttClient.h>
 #include <ArduinoJson.h>
+#include <U8g2lib.h>
+#include <qrcode.h>
 #include <math.h>
 #include <time.h>
 #include <esp_system.h>
@@ -28,6 +30,14 @@ constexpr uint8_t SDA_PIN = 21;
 constexpr uint8_t SCL_PIN = 22;
 constexpr uint8_t ADXL345_ADDRESS = 0x53;
 
+// OLED display on GPIO18/19 using software I2C. The ADXL345 keeps the
+// hardware I2C bus on GPIO21/22, so the two devices do not reconfigure Wire.
+constexpr uint8_t OLED_SCL_PIN = 18;
+constexpr uint8_t OLED_SDA_PIN = 19;
+constexpr uint8_t QR_VERSION = 5;  // 37x37 modules; ECC_LOW supports up to 106 ASCII bytes.
+constexpr uint8_t QR_QUIET_ZONE = 4;
+constexpr uint32_t OLED_PAGE_INTERVAL_MS = 8000;
+
 // NEO-6M GPS - UART2
 constexpr uint8_t GPS_RX_PIN = 16;  // ESP32 RX <- GPS TX
 constexpr uint8_t GPS_TX_PIN = 17;  // ESP32 TX -> GPS RX
@@ -41,7 +51,7 @@ constexpr char FIRMWARE_VERSION[] = "0.2.0-mqtt";
 constexpr char HARDWARE_MODEL[] = "esp32-devkit-v1";
 
 constexpr uint32_t ACCEL_INTERVAL_MS = 10;
-constexpr uint32_t DASHBOARD_INTERVAL_MS = 15000;
+constexpr uint32_t DASHBOARD_INTERVAL_MS = 1000;
 constexpr uint32_t TEMP_INTERVAL_MS = 2000;
 constexpr uint32_t TEMP_CONVERSION_MS = 750;
 constexpr uint32_t GPS_MAX_AGE_MS = 5000;
@@ -66,6 +76,20 @@ TinyGPSPlus gps;
 HardwareSerial GPS_Serial(2);
 OneWire oneWire(TEMP_PIN);
 DallasTemperature tempSensors(&oneWire);
+
+// Verified SH1106 controller from the standalone 1.3-inch OLED test.
+// Software I2C preserves the existing ADXL345 Wire bus on GPIO21/22.
+U8G2_SH1106_128X64_NONAME_F_SW_I2C oled(
+    U8G2_R0, OLED_SCL_PIN, OLED_SDA_PIN, U8X8_PIN_NONE
+);
+bool oledReady = false;
+bool oledShowQrPage = false;
+uint32_t lastOledPageChangeMs = 0;
+uint32_t lastOledRenderMs = 0;
+String trackingUrl;
+String configuredPackageId;
+static uint8_t qrBuffer[256];
+QRCode trackingQr;
 
 // =====================================================
 // 4. MQTT / NETWORK OBJECTS
@@ -347,11 +371,139 @@ void publishRegistration() {
     capabilities["temperature"] = true;
     capabilities["accelerometer"] = true;
     capabilities["gnss"] = true;
-    capabilities["epaper"] = false;
+    capabilities["oled"] = true;
+    capabilities["qr_display"] = true;
 
     if (enqueueEnvelope("register", payload, OutboundKind::Registration)) {
         lastRegistrationAttemptMs = millis();
         Serial.println("Queued device registration.");
+    }
+}
+
+void renderOledDashboard() {
+    oled.clearBuffer();
+    oled.setDrawColor(1);
+
+    oled.setFont(u8g2_font_5x8_tf);
+    oled.drawStr(0, 8, "COLDGUARDIAN");
+    oled.drawStr(86, 8, mqttClient.connected() ? "MQTT OK" : "NO MQTT");
+
+    const String identityLine = configuredPackageId.length()
+        ? configuredPackageId : String("NO PACKAGE ASSIGNED");
+    oled.drawStr(0, 18, identityLine.c_str());
+
+    char temperatureLine[20];
+    if (tempReadingAvailable && isfinite(temperatureC)) {
+        snprintf(temperatureLine, sizeof(temperatureLine), "%.1f C", temperatureC);
+    } else {
+        snprintf(temperatureLine, sizeof(temperatureLine), "--.- C");
+    }
+    oled.setFont(u8g2_font_helvB14_tf);
+    oled.drawStr(0, 39, temperatureLine);
+
+    oled.setFont(u8g2_font_5x8_tf);
+    if (canMonitorDevice()) {
+        char limits[32];
+        snprintf(limits, sizeof(limits), "LIM %.1f..%.1f C  SHK %.1fg",
+                 configuredMinTemperatureC, configuredMaxTemperatureC,
+                 configuredShockThresholdG);
+        oled.drawStr(0, 50, limits);
+    } else {
+        oled.drawStr(0, 50, "WAITING FOR PACKAGE CONFIG");
+    }
+
+    char statusLine[32];
+    snprintf(statusLine, sizeof(statusLine), "%s  %s",
+             hasRecentGpsFix() ? "GPS FIX" : "GPS SEARCH",
+             canMonitorDevice() ? "MONITOR ON" : "MONITOR OFF");
+    oled.drawStr(0, 62, statusLine);
+    oled.sendBuffer();
+}
+
+void renderTrackingQr() {
+    oled.clearBuffer();
+    oled.setDrawColor(1);
+    oled.setFont(u8g2_font_5x8_tf);
+
+    if (trackingUrl.length() == 0) {
+        oled.drawStr(0, 10, "QR URL MISSING");
+        oled.drawStr(0, 25, "Run test.py and rotate token");
+        oled.drawStr(0, 39, configuredPackageId.c_str());
+        oled.sendBuffer();
+        Serial.println("OLED QR page shown, but backend config has no tracking_url.");
+        return;
+    }
+
+    // QRCode v5 at ECC_LOW supports up to 106 ASCII bytes.
+    if (trackingUrl.length() > 106) {
+        oled.drawStr(0, 10, "TRACKING URL TOO LONG");
+        oled.drawStr(0, 25, "Shorten PUBLIC_BASE_URL");
+        oled.drawStr(0, 39, configuredPackageId.c_str());
+        oled.sendBuffer();
+        Serial.printf("OLED QR not rendered: tracking URL is %u bytes (max 106).\n",
+                      static_cast<unsigned int>(trackingUrl.length()));
+        return;
+    }
+
+    const int8_t result = qrcode_initText(
+        &trackingQr, qrBuffer, QR_VERSION, ECC_LOW, trackingUrl.c_str()
+    );
+    if (result != 0 || trackingQr.size == 0 || trackingQr.size + (2 * QR_QUIET_ZONE) > 64) {
+        oled.drawStr(0, 10, "QR GENERATION FAILED");
+        oled.sendBuffer();
+        Serial.printf("OLED QR generation failed (result=%d, size=%u).\n",
+                      static_cast<int>(result), static_cast<unsigned int>(trackingQr.size));
+        return;
+    }
+
+    oled.drawStr(0, 8, "SCAN TO TRACK");
+    const int totalSize = trackingQr.size + (2 * QR_QUIET_ZONE);
+    const int left = (128 - totalSize) / 2;
+    const int top = 11;
+    const int qrLeft = left + QR_QUIET_ZONE;
+    const int qrTop = top + QR_QUIET_ZONE;
+
+    // OLEDs illuminate lit pixels. Draw a light quiet zone, then dark modules,
+    // so the QR uses the standard dark-on-light polarity for scanner compatibility.
+    oled.setDrawColor(1);
+    oled.drawBox(left, top, totalSize, totalSize);
+    oled.setDrawColor(0);
+    for (uint8_t y = 0; y < trackingQr.size; ++y) {
+        for (uint8_t x = 0; x < trackingQr.size; ++x) {
+            if (qrcode_getModule(&trackingQr, x, y)) {
+                oled.drawPixel(qrLeft + x, qrTop + y);
+            }
+        }
+    }
+    oled.setDrawColor(1);
+    oled.sendBuffer();
+    Serial.printf("OLED QR rendered for package %s (%u-byte URL).\n",
+                  configuredPackageId.c_str(),
+                  static_cast<unsigned int>(trackingUrl.length()));
+}
+
+void serviceOled(uint32_t now) {
+    if (!oledReady) return;
+
+    bool pageChanged = false;
+    // Always rotate pages, even if tracking_url is missing, so the OLED can
+    // show a clear QR diagnostic instead of silently staying on the dashboard.
+    if (static_cast<uint32_t>(now - lastOledPageChangeMs) >= OLED_PAGE_INTERVAL_MS) {
+        lastOledPageChangeMs = now;
+        oledShowQrPage = !oledShowQrPage;
+        pageChanged = true;
+    }
+
+    if (pageChanged || lastOledRenderMs == 0) {
+        lastOledRenderMs = now;
+        if (oledShowQrPage) {
+            renderTrackingQr();
+        } else {
+            renderOledDashboard();
+        }
+        Serial.printf("OLED page: %s; tracking URL available: %s.\n",
+                      oledShowQrPage ? "QR" : "dashboard",
+                      trackingUrl.length() > 0 ? "yes" : "no");
     }
 }
 
@@ -383,6 +535,16 @@ void handleConfigMessage(const String &body) {
 
     const bool incomingAssigned = config["assignment"]["assigned"] | false;
     const bool incomingMonitoring = config["monitoring"]["enabled"] | false;
+    String incomingTrackingUrl = config["tracking_url"] | "";
+    String incomingPackageId = config["assignment"]["package_id"] | "";
+    if (!(incomingTrackingUrl.startsWith("http://") || incomingTrackingUrl.startsWith("https://")) ||
+        incomingTrackingUrl.length() > 180) {
+        incomingTrackingUrl = "";
+    }
+    if (!incomingAssigned) {
+        incomingTrackingUrl = "";
+        incomingPackageId = "";
+    }
     float newMin = NAN;
     float newMax = NAN;
     float newShock = NAN;
@@ -425,6 +587,16 @@ void handleConfigMessage(const String &body) {
     reportingIntervalMs = newReportIntervalMs;
     configuredProductSku = config["package"]["product_sku"] | "";
     configuredProductName = config["package"]["product_name"] | "";
+    configuredPackageId = incomingPackageId;
+    trackingUrl = incomingTrackingUrl;
+    oledShowQrPage = false;
+    lastOledPageChangeMs = millis();
+    lastOledRenderMs = 0;  // Render the new package state immediately.
+    if (trackingUrl.length() > 0) {
+        Serial.println("Tracking QR URL received from backend; token omitted from Serial output.");
+    } else if (deviceAssigned) {
+        Serial.println("WARNING: assigned config has no tracking URL; rotate the package token in the backend.");
+    }
 
     // A new package config is a new monitoring context.
     temperatureBreachActive = false;
@@ -932,6 +1104,18 @@ void setup() {
 
     initializeTemperatureSensor();
 
+    oled.begin();
+    oledReady = true;
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_6x10_tf);
+    oled.drawStr(0, 12, "COLDGUARDIAN");
+    oled.drawStr(0, 28, "OLED READY");
+    oled.drawStr(0, 44, "Waiting for package");
+    oled.sendBuffer();
+    Serial.printf("OLED initialized (SH1106, software I2C SDA=%u SCL=%u).\n",
+                  static_cast<unsigned int>(OLED_SDA_PIN),
+                  static_cast<unsigned int>(OLED_SCL_PIN));
+
     mqttClient.onMessage(onMqttMessage);
     beginWifi();
 
@@ -967,4 +1151,6 @@ void loop() {
         lastDashboardMs = now;
         printDashboard();
     }
+
+    serviceOled(now);
 }
