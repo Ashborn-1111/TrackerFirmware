@@ -12,6 +12,7 @@
 #include <math.h>
 #include <time.h>
 #include <esp_system.h>
+#include <esp_mac.h>   // Read the factory-derived Wi-Fi station MAC before Wi-Fi starts.
 
 #include "secrets.h"  // Create include/secrets.h from the provided example.
 
@@ -40,7 +41,7 @@ constexpr char FIRMWARE_VERSION[] = "0.2.0-mqtt";
 constexpr char HARDWARE_MODEL[] = "esp32-devkit-v1";
 
 constexpr uint32_t ACCEL_INTERVAL_MS = 10;
-constexpr uint32_t DASHBOARD_INTERVAL_MS = 1000;
+constexpr uint32_t DASHBOARD_INTERVAL_MS = 15000;
 constexpr uint32_t TEMP_INTERVAL_MS = 2000;
 constexpr uint32_t TEMP_CONVERSION_MS = 750;
 constexpr uint32_t GPS_MAX_AGE_MS = 5000;
@@ -73,11 +74,48 @@ DallasTemperature tempSensors(&oneWire);
 WiFiClient mqttTransport;
 MqttClient mqttClient(mqttTransport);
 
-const String deviceId = String(COLDGUARDIAN_DEVICE_ID);
-const String messageTopic = String("coldchain/") + deviceId + "/messages";
-const String ackTopic = String("coldchain/") + deviceId + "/registration/ack";
-const String configTopic = String("coldchain/") + deviceId + "/config";
-const String mqttClientId = String("coldguardian-") + deviceId;
+// Filled from the ESP32 station-interface MAC in setup(). The generated ID
+// is stable for this board and uses only characters accepted by the backend:
+// tracker-AA-BB-CC-DD-EE-FF.
+String deviceId;
+String messageTopic;
+String ackTopic;
+String configTopic;
+String mqttClientId;
+
+bool initializeDeviceIdentity() {
+    // Arduino-ESP32 core 3.x may return 00:00:00:00:00:00 from
+    // WiFi.macAddress() until the STA netif has started. Read the STA MAC
+    // directly from ESP-IDF instead; this works before WiFi.begin().
+    uint8_t macBytes[6] = {};
+    const esp_err_t macResult = esp_read_mac(macBytes, ESP_MAC_WIFI_STA);
+    if (macResult != ESP_OK) {
+        Serial.printf("ERROR: esp_read_mac(WIFI_STA) failed: %d\n",
+                      static_cast<int>(macResult));
+        return false;
+    }
+
+    char macBuffer[18];
+    const int written = snprintf(
+        macBuffer, sizeof(macBuffer), "%02X-%02X-%02X-%02X-%02X-%02X",
+        macBytes[0], macBytes[1], macBytes[2],
+        macBytes[3], macBytes[4], macBytes[5]);
+    if (written != 17) {
+        Serial.println("ERROR: Failed to format ESP32 Wi-Fi station MAC.");
+        return false;
+    }
+    const String mac(macBuffer);
+
+    deviceId = String("tracker-") + mac;
+    messageTopic = String("coldchain/") + deviceId + "/messages";
+    ackTopic = String("coldchain/") + deviceId + "/registration/ack";
+    configTopic = String("coldchain/") + deviceId + "/config";
+    mqttClientId = String("coldguardian-") + deviceId;
+
+    Serial.printf("ESP32 station MAC: %s\n", mac.c_str());
+    Serial.printf("ColdGuardian device ID: %s\n", deviceId.c_str());
+    return true;
+}
 
 bool ntpConfigured = false;
 bool registrationAcknowledged = false;
@@ -90,6 +128,7 @@ uint32_t nextMessageSeq = 0;
 uint32_t reportingIntervalMs = 15000;
 uint32_t lastWifiRetryMs = 0;
 uint32_t lastMqttAttemptMs = 0;
+bool mqttAttemptedOnce = false;  // Attempt immediately after Wi-Fi connects; retry interval applies afterward.
 uint32_t lastRegistrationAttemptMs = 0;
 uint32_t lastTelemetryMs = 0;
 
@@ -253,7 +292,11 @@ void flushOneQueuedMessage() {
 
     // ArduinoMqttClient supports QoS 1. endMessage waits for PUBACK.
     // If it fails, keep the exact same body/sequence at the queue head.
-    if (!mqttClient.beginMessage(messageTopic, false, 1)) {
+    if (!mqttClient.beginMessage(
+            messageTopic,
+            static_cast<unsigned long>(message.body.length()),
+            false,
+            1)) {
         Serial.println("MQTT beginMessage failed; retaining queued message.");
         return;
     }
@@ -437,7 +480,6 @@ void onMqttMessage(int messageSize) {
 // =====================================================
 
 void beginWifi() {
-    WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     lastWifiRetryMs = millis();
@@ -466,10 +508,14 @@ void serviceNetwork(uint32_t now) {
     }
 
     if (!mqttClient.connected()) {
-        if ((uint32_t)(now - lastMqttAttemptMs) < MQTT_RETRY_INTERVAL_MS) {
+        // Do not make the first connection wait five seconds from boot. Once
+        // Wi-Fi is available, try immediately; rate-limit later retries.
+        if (mqttAttemptedOnce &&
+            (uint32_t)(now - lastMqttAttemptMs) < MQTT_RETRY_INTERVAL_MS) {
             return;
         }
         lastMqttAttemptMs = now;
+        mqttAttemptedOnce = true;
 
         mqttClient.stop();
         mqttClient.setId(mqttClientId);
@@ -857,6 +903,13 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.println("\nColdGuardian firmware + MQTT starting...");
+
+    if (!initializeDeviceIdentity()) {
+        Serial.println("Device identity initialization failed; halting.");
+        while (true) {
+            delay(1000);
+        }
+    }
 
     char bootIdBuffer[9];
     snprintf(bootIdBuffer, sizeof(bootIdBuffer), "%08lx",
